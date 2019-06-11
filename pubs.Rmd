@@ -1,0 +1,314 @@
+---
+title: "Pub Crawl em BH"
+author: "Gerson Vasconcelos"
+output: html_notebook
+---
+
+
+Pegando os pacotes que vamos usar  
+
+```{r, eval = F}
+pacotes <-  c('leaflet', 
+         'reticulate',
+         'tspmeta',
+         'qdapRegex',
+         'kableExtra',
+         'knitr',
+         'dplyr',
+         'httr',
+         'rvest',
+         'stringr',
+         'ggmap',
+         'googleway')
+
+lapply(pacotes, require, character.only = TRUE, quietly = TRUE)
+
+# especificando a versão do python que iremos usar
+reticulate::use_python('~/anaconda3/bin/python', required = TRUE)
+```
+
+pegando o nome e a localização dos bares
+```{r}
+
+site <- GET('https://www.viajali.com.br/bares-bh/')
+
+
+bares <- site %>% 
+  read_html() %>%
+  html_nodes('h3') %>% html_text()
+
+localizacao <- site %>% 
+  read_html() %>% 
+  html_nodes('p') %>% 
+  html_text()
+
+bar_loc_list = c()
+for (loc in localizacao){
+  
+  endereco <- str_match(loc, 'Localização: (.*).')[2]
+  
+  bar_loc_list <- c(bar_loc_list, endereco)
+  
+}
+
+bar_list = c()
+for (bar in bares){
+  
+  endereco <- str_match(bar, '([A-Za-z].*)')[2]
+  
+  bar_list <- c(bar_list, endereco)
+  
+}
+
+bar_loc_list <- as.list(bar_loc_list)
+bar_loc_list <- bar_loc_list[!is.na(bar_loc_list)]
+bar_list <- as.list(bar_list)
+
+# ajustes nos enderecos
+bar_loc_list[[2]] <- bar_loc_list[[2]] %>% substr(.,18,48) %>% paste(., '- Savassi')
+bar_loc_list[[10]] <- bar_loc_list[[10]] %>% substr(.,1,nchar(bar_loc_list[[10]])-35)
+bar_loc_list[[16]] <- bar_loc_list[[16]] %>% substr(., 23,59)
+bar_loc_list[[30]] <- bar_loc_list[[30]] %>% substr(., 2, nchar(bar_loc_list[[30]]))
+
+# criando um dicionario com os nomes dos bares e localizacoes
+listao <- vector(mode="list", length=30)
+names(listao) <- bar_list
+for(i in 1:length(listao)){
+  listao[[i]] = bar_loc_list[[i]]
+}
+
+listao2 <- py_dict(keys = bar_list, values = bar_loc_list)
+
+```
+
+
+Pegando as localizações com o Google Maps API
+
+```{r}
+
+gmaps_key <-  'XXXXXXXXX'
+register_google(key = gmaps_key)
+set_key(gmaps_key)
+
+end <- data.frame("lon" = NA, "lat" = NA, "endereco" = NA, "bar" = NA)
+
+for (i in 1:length(listao)){
+
+  end_temp <- ggmap::geocode(listao[[i]])
+
+  end_temp <- cbind(end_temp, data.frame("endereco" = listao[[i]], "bar" = names(listao)[i]))
+
+  end <- rbind(end, end_temp)
+
+
+}
+
+
+
+end <- end[-1,]
+
+
+```
+
+Antes de continuarmos, vamos plotar para ver como ficou. E definir um ponto inicial. Para o inicio vamos definir o Café com letras, um bar tradicionalíssimo em BH e que está no centro dos outros.
+
+```{r}
+
+ponto_inicial_lat <- end$lat[end$bar == 'Café com Letras']
+ponto_inicial_long <- end$lon[end$bar == 'Café com Letras']
+
+
+bar_map = leaflet(data = end) %>% 
+          addProviderTiles("CartoDB.DarkMatter") %>%
+          addCircleMarkers(lat=~lat, 
+                           lng=~lon,
+                           color = "blue",
+                           radius = 4,
+                           weight = 10,
+                           stroke = FALSE,
+                           opacity = 4,
+                           fillOpacity = 2
+                           )
+
+bar_map
+
+```
+
+Porém, como estaremos andando vamos nos limitar a um raio de 3km do ponto inicial.
+
+```{r}
+# essa função nos retorna a distância entre dois pontos em uma esfera
+distancia <- function (lat1, long1, lat2, long2){
+  rad = pi/180
+  a1 = lat1 * rad
+  a2 = long1 * rad
+  b1 = lat2 * rad
+  b2 = long2 * rad
+  dlon = b2 - a2
+  dlat = b1 - a1
+  a = (sin(dlat/2))^2 + cos(a1) * cos(b1) * (sin(dlon/2))^2
+  c = 2 * atan2(sqrt(a), sqrt(1 - a))
+  R = 6378.14 # raio equatorial da terra
+  d = R * c
+  return(d) # medida em km
+}
+
+distancia_km <- 3
+
+bares_proximos <- end %>%
+  mutate(distancia_do_inicial = distancia(ponto_inicial_lat, ponto_inicial_long, lat, lon)) %>% 
+  filter(distancia_do_inicial <= distancia_km)
+
+```
+
+
+Ainda nos restaram 22 bares para visitar. Com um copo de chopp em cada local, que tem em média 300ml e 5% de teor alcoólico, você terá ingerido aproximadamente 330 ml de álcool, ou seja, se organizar direitinho todo mundo fica bêbado.
+
+Agora vamos transformar nossas latitudes e longitudes em uma matriz de distância. Essa matriz vai nos mostrar a distância euclidiana entre de cada bar com outro bar.
+
+```{r}
+# trocar para que o cafe com letras seja o indice 1
+bares_proximos <- bares_proximos[c(2,1,3:nrow(bares_proximos)),]
+
+coordenadas <- bares_proximos %>% 
+  select(lon:bar) %>% 
+  mutate(indice_loc = 1:n())%>% 
+  arrange(indice_loc)
+
+matriz_coordenadas <- coordenadas %>% 
+  select(lat,lon) %>% 
+  as.matrix()
+
+matriz_dist <- dist(matriz_coordenadas)
+
+```
+
+
+Vamos agora otimizar com o algorítmo do caixeiro viajante 2-optimization, que funciona, basicamente, procurando por melhoras deletando duas arestas e testando-as com outra ligação, se o caminho estiver menos custoso então esse será o novo caminho.
+
+```{r}
+
+TSP_instance <- tspmeta::tsp_instance(matriz_coordenadas, matriz_dist)
+
+caminho_otimo <- as.integer(tspmeta::run_solver(TSP_instance, method = '2-opt'))
+
+# comecar no ponto inicial
+caminho_inic <- c(caminho_otimo[which(caminho_otimo == 1):length(caminho_otimo)],
+                  caminho_otimo[1:(which(caminho_otimo == 1)- 1)])
+
+
+# adicionando a rota aos dados
+coordenadas <- coordenadas %>%
+  inner_join(data.frame(indice_loc = caminho_inic,
+                        ordem_rota = 1:length(caminho_inic))) %>% 
+  arrange(ordem_rota)
+
+
+# reformatando para colocar cada linha com sua lat long inicial e final
+df_rota <- coordenadas %>% 
+  rename(inicio_lat = lat,
+         inicio_long = lon) %>% 
+  mutate(fim_lat = c(inicio_lat[2:n()], NA),
+         fim_long = c(inicio_long[2:n()], NA)) %>%
+  na.omit() %>% 
+  mutate(end_inicio = paste(inicio_lat,inicio_long,sep = ' '),
+         end_fim = paste(fim_lat,fim_long,sep = ' '))
+
+
+```
+
+
+Agora vamos calcular o quanto vamos andar e quanto tempo vamos gastar.
+
+```{r}
+pegar_caminho <- function(x){
+  
+   result <- google_directions(
+     origin = x[['end_inicio']],
+     destination = x[['end_fim']],
+     mode = 'walking'
+   )
+
+  
+  df_result <- data.frame(
+    origem = x[['end_inicio']],
+    destino = x[['end_fim']],
+     distancia = result$routes$legs[[1]]$distance$value,
+     duracao = result$routes$legs[[1]]$duration$value
+  )
+  
+  return(df_result)
+}
+
+list_polygonos <- apply(df_rota, 1, pegar_caminho)
+
+# transformando para DF
+df_directions <- do.call(rbind, list_polygonos)
+
+
+```
+
+
+```{r}
+
+print(paste0('Andaremos ',sum(df_directions$distancia)/1000,'Km'))
+print(paste0('Nosso tempo de deslocamento será aproximadamente ',round(sum(df_directions$duracao)/3600,2), ' horas'))
+
+```
+
+Ou seja, é Pub Crawl maratona, vamos levar uns sapatos confortáveis e muita vontade de beber.
+
+
+```{r}
+label_inicial <- df_rota %>% 
+                  filter(ordem_rota == 1)
+
+# Visualization
+leaflet(data = df_rota) %>%
+  setView(lng = ponto_inicial_long, lat = ponto_inicial_lat, zoom = 14) %>% 
+  addProviderTiles("CartoDB.DarkMatter") %>%
+  addPolylines(data = df_rota,
+               lng = ~inicio_long,
+               lat = ~inicio_lat,
+               color = "blue",
+               opacity = 4
+               ) %>% 
+  addMarkers(lng = ponto_inicial_long,
+             lat = ponto_inicial_lat
+             ) %>% 
+  addCircleMarkers(data = df_rota,
+                   lng = ~inicio_long,
+                   lat = ~inicio_lat,
+                   radius = 4,
+                   label = ~as.character(bar),
+                   labelOptions = labelOptions(noHide = T,
+                                               textOnly = T,
+                                               direction = 'bottom',
+                                               textsize = "14px",
+                                               offset=c(0,-30),
+                                               size = 1,
+                                               style = list(
+                                                        "color" = "red",
+                                                        "font-family" = "serif",
+                                                        "font-style" = "italic",
+                                                        "box-shadow" = "3px 3px rgba(0,0,0,0.25)",
+                                                        "font-size" = "12px",
+                                                        "border-color" = "rgba(0,0,0,0.5)")))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
